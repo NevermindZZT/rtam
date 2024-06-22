@@ -16,15 +16,27 @@
 #endif
 
 #ifndef RTAM_PRINT
-#define RTAM_PRINT(...)                 printf(__VA_ARGS__)
+    #define RTAM_PRINT(...)                 printf(__VA_ARGS__)
+#endif
+
+#ifndef RTAM_MALLOC
+    #define RTAM_MALLOC(x)                  malloc(x)
+#endif
+
+#ifndef RTAM_FREE
+    #define RTAM_FREE(x)                    free(x)
 #endif
 
 #ifndef RTAM_WITH_LETTER_SHELL
-#define RTAM_WITH_LETTER_SHELL          0
+    #define RTAM_WITH_LETTER_SHELL          0
 #endif
 
 #ifndef RTAM_DELAY
-#define RTAM_DELAY(ms)                  sleep(ms)
+    #define RTAM_DELAY(ms)                  sleep(ms)
+#endif
+
+#ifndef RTAM_DEBUG_ENABLE
+    #define RTAM_DEBUG_ENABLE               0
 #endif
 
 #endif

@@ -9,13 +9,15 @@
  * 
  */
 #include "rtam.h"
-#include "rtam_cfg_user.h"
 #include "string.h"
 
 #if RTAM_WITH_LETTER_SHELL == 1
     #include "shell.h"
 #endif /* RTAM_WITH_LETTER_SHELL == 1 */
 
+#define RTAM_DEBUG(...) \
+    if (RTAM_DEBUG_ENABLE) \
+        RTAM_PRINT(__VA_ARGS__)
 
 #if defined(__CC_ARM) || (defined(__ARMCC_VERSION) && __ARMCC_VERSION >= 6000000)
     extern const size_t rtApp$$Bas;
@@ -26,6 +28,12 @@
     extern const size_t _rt_app_start;
     extern const size_t _rt_app_end;
 #endif
+
+#define RTAM_INTERFACE_CHECK(app) \
+    if ((app)->interface == NULL) { \
+        RTAM_PRINT("app %s interface is NULL", (app)->name); \
+        return -1; \
+    }
 
 /**
  * @brief single instance of manager
@@ -61,38 +69,219 @@ void rtamInit(void) {
     #error not supported compiler
 #endif
 
+    rtManager.processes = NULL;
     rtamLaunchAutoStart();
 }
 
 
-static int rtamStart(RtApp *app) {
-    if (app->getStatus && RTAPP_GET_RUN_STATUS(app->getStatus()) != RTAPP_STATUS_STOPPED) {
-        RTAM_PRINT("app %s is already running", app->name);
-        return -1;
-    }
-    if (app->start) {
-        if (app->required != NULL) {
-            for (size_t i = 0; app->required[i] != NULL; i++) {
-                if (rtamLunchAndWait(app->required[i], -1) != 0) {
-                    RTAM_PRINT("app %s required app %s not running", app->name, app->required[i]);
-                    return -1;
-                }
-            }
+static RtProcess* rtamGetProcess(const char *name) {
+    RtProcess *process = rtManager.processes;
+    while (process != NULL) {
+        if (strcmp(process->app->name, name) == 0) {
+            return process;
         }
-        RTAM_PRINT("start app %s", app->name);
-        return app->start();
-    } else {
-        return -1;
+        process = process->next;
+    }
+    return NULL;
+}
+
+
+static RtProcess* rtamAddProcess(const char *name) {
+    RtProcess *exsited = rtamGetProcess(name);
+    if (exsited != NULL) {
+        return exsited;
+    }
+    for (size_t i = 0; i < rtManager.apps.count; i++) {
+        if (strcmp(rtManager.apps.base[i].name, name) == 0) {
+            RtProcess *process = RTAM_MALLOC(sizeof(RtProcess));
+            if (process == NULL) {
+                return NULL;
+            }
+            process->app = &rtManager.apps.base[i];
+            process->status.value = 0;
+            process->next = rtManager.processes;
+            rtManager.processes = process;
+            return process;
+        }
+    }
+    return NULL;
+
+}
+
+
+static void rtamRemoveProcess(const char *name) {
+    RtProcess *process = rtManager.processes;
+    RtProcess *prev = NULL;
+    while (process != NULL) {
+        if (strcmp(process->app->name, name) == 0) {
+            if (prev == NULL) {
+                rtManager.processes = process->next;
+            } else {
+                prev->next = process->next;
+            }
+            RTAM_FREE(process);
+            return;
+        }
+        prev = process;
+        process = process->next;
     }
 }
 
 
-static int rtamStop(RtApp *app) {
-    if (app->stop) {
-        app->stop();
-        return 0;
+static RtAppErr rtamStart(RtProcess *process, int timeout) {
+    const RtAppInterface *interface = process->app->interface;
+    RTAM_DEBUG("start app %s", process->app->name);
+    if (process->status.started) {
+        RTAM_PRINT("app %s is already started", process->app->name);
+        return RTAM_OK;
+    }
+    if (interface->start) {
+        if (process->status.processing) {
+            RTAM_PRINT("app %s is processing", process->app->name);
+            return RTAM_PROCESSING;
+        }
+        process->status.processing = 1;
+        const RtAppDependencies *dependencies = process->app->dependencies;
+        if (dependencies != NULL && dependencies->required != NULL) {
+            for (size_t i = 0; dependencies->required[i] != NULL; i++) {
+                RtAppErr err = rtamLaunch(dependencies->required[i]);
+                if (err == RTAM_PROCESSING) {
+                    RtProcess *requiredProcess = rtamGetProcess(dependencies->required[i]);
+                    int time = 0;
+                    while ((timeout > 0 && time < timeout) || timeout == -1) {
+                        if (requiredProcess->status.started) {
+                            break;
+                        }
+                        RTAM_DELAY(10);
+                        time += 10;
+                    }
+                }
+            }
+        }
+        if (dependencies != NULL && dependencies->conflicted != NULL) {
+            for (size_t i = 0; dependencies->conflicted[i] != NULL; i++) {
+                RtAppErr err = rtamTerminate(dependencies->conflicted[i]);
+                if (err == RTAM_PROCESSING) {
+                    RtProcess *conflictedProcess = rtamGetProcess(dependencies->conflicted[i]);
+                    int time = 0;
+                    while ((timeout > 0 && time < timeout) || timeout == -1) {
+                        if (!conflictedProcess->status.started) {
+                            break;
+                        }
+                        RTAM_DELAY(10);
+                        time += 10;
+                    }
+                }
+            }
+        }
+        RTAM_DEBUG("call app start %s", process->app->name);
+        RtAppErr err = interface->start();
+        if (err == RTAM_OK) {
+            process->status.started = 1;
+        }
+        if (err != RTAM_PROCESSING) {
+            process->status.processing = 0;
+        }
+        return err;
     } else {
-        return -1;
+        RTAM_PRINT("start interface not implemented for app: %s", process->app->name);
+        return RTAM_FAIL;
+    }
+}
+
+
+static RtAppErr rtamStop(RtProcess *process) {
+    const RtAppInterface *interface = process->app->interface;
+    if (!process->status.started) {
+        RTAM_PRINT("app %s is already stoped", process->app->name);
+        return RTAM_OK;
+    }
+    if (interface->stop) {
+        if (process->status.processing) {
+            RTAM_PRINT("app %s is processing", process->app->name);
+            return RTAM_PROCESSING;
+        }
+        process->status.processing = 1;
+        RtProcess *head = rtManager.processes;
+        for (; head != NULL;) {
+            const RtAppDependencies *dependencies = head->app->dependencies;
+            if (dependencies != NULL && dependencies->required != NULL) {
+                for (size_t i = 0; dependencies->required[i] != NULL; i++) {
+                    if (strcmp(process->app->name, dependencies->required[i]) == 0) {
+                        rtamStop(head);
+                    }
+                }
+            }
+            head = head->next;
+        }
+        RTAM_DEBUG("call app stop %s", process->app->name);
+        RtAppErr err = interface->stop();
+        if (err == RTAM_OK) {
+            process->status.started = 0;
+        }
+        if (err != RTAM_PROCESSING) {
+            process->status.processing = 0;
+        }
+        return err;
+    } else {
+        RTAM_PRINT("stop interface not implemented for app: %s", process->app->name);
+        return RTAM_FAIL;
+    }
+}
+
+
+static RtAppErr rtamSuspend(RtProcess *process) {
+    const RtAppInterface *interface = process->app->interface;
+    if (!process->status.resuming) {
+        RTAM_PRINT("app %s is already suspend", process->app->name);
+        return RTAM_OK;
+    }
+    if (interface->suspend) {
+        if (process->status.processing) {
+            RTAM_PRINT("app %s is processing", process->app->name);
+            return RTAM_PROCESSING;
+        }
+        process->status.processing = 1;
+        RTAM_DEBUG("call app suspend %s", process->app->name);
+        RtAppErr err = interface->suspend();
+        if (err == RTAM_OK) {
+            process->status.resuming = 0;
+        }
+        if (err != RTAM_PROCESSING) {
+            process->status.processing = 0;
+        }
+        return err;
+    } else {
+        process->status.resuming = 0;
+        return RTAM_NOT_SUPPORT;
+    }
+}
+
+
+static RtAppErr rtamResume(RtProcess *process) {
+    const RtAppInterface *interface = process->app->interface;
+    if (process->status.resuming) {
+        RTAM_PRINT("app %s is already resuming", process->app->name);
+        return RTAM_OK;
+    }
+    if (interface->resume) {
+        if (process->status.processing) {
+            RTAM_PRINT("app %s is processing", process->app->name);
+            return RTAM_PROCESSING;
+        }
+        process->status.processing = 1;
+        RTAM_DEBUG("call app resume %s", process->app->name);
+        RtAppErr err = interface->resume();
+        if (err == RTAM_OK) {
+            process->status.resuming = 1;
+        }
+        if (err != RTAM_PROCESSING) {
+            process->status.processing = 0;
+        }
+        return err;
+    } else {
+        process->status.resuming = 1;
+        return RTAM_NOT_SUPPORT;
     }
 }
 
@@ -100,46 +289,24 @@ static int rtamStop(RtApp *app) {
 static void rtamLaunchAutoStart(void) {
     for (size_t i = 0; i < rtManager.apps.count; i++) {
         if (rtManager.apps.base[i].flags.autoStart) {
-            rtamStart(&rtManager.apps.base[i]);
+            rtamLaunch(rtManager.apps.base[i].name);
         }
     }
 }
 
 
-int rtamLunchAndWait(const char *name, size_t timeout) {
-    for (size_t i = 0; i < rtManager.apps.count; i++) {
-        if (strcmp(rtManager.apps.base[i].name, name) == 0) {
-            int (*getStatus)(void) = rtManager.apps.base[i].getStatus;
-            if (getStatus && RTAPP_GET_RUN_STATUS(getStatus()) == RTAPP_STATUS_RUNNING) {
-                return 0;
-            }
-            if ((getStatus && getStatus() == RTAPP_STATUS_STARING)
-                || rtamStart(&rtManager.apps.base[i]) == 0) {
-                int time = 0;
-                RTAM_PRINT("wait for app %s start", name);
-                while ((timeout > 0 && time < timeout) || timeout == -1) {
-                    if (getStatus == NULL 
-                        || RTAPP_GET_RUN_STATUS(getStatus()) == RTAPP_STATUS_RUNNING) {
-                        return 0;
-                    }
-                    RTAM_DELAY(10);
-                    time += 10;
-                }
-            }
-        }
+RtAppErr rtamLaunch(const char *name) {
+    RtProcess *process = rtamAddProcess(name);
+    if (process == NULL) {
+        RTAM_PRINT("app %s not found", name);
+        return RTAM_FAIL;
     }
-    return -1;
-}
-
-
-int rtamLaunch(const char *name) {
-    for (size_t i = 0; i < rtManager.apps.count; i++) {
-        if (strcmp(rtManager.apps.base[i].name, name) == 0) {
-            return rtamStart(&rtManager.apps.base[i]);
-        }
+    RTAM_INTERFACE_CHECK(process->app);
+    RtAppErr err = rtamStart(process, -1);
+    if (err == RTAM_OK) {
+        return rtamResume(process);
     }
-    RTAM_PRINT("app %s not found", name);
-    return -1;
+    return err;
 }
 #if RTAM_WITH_LETTER_SHELL == 1
 SHELL_EXPORT_CMD(SHELL_CMD_PERMISSION(0)|SHELL_CMD_TYPE(SHELL_TYPE_CMD_FUNC),
@@ -147,18 +314,58 @@ rtamLaunch, rtamLaunch, launch application\nrtamLaunch [name]);
 #endif
 
 
-int rtamTerminate(const char *name) {
-    for (size_t i = 0; i < rtManager.apps.count; i++) {
-        if (strcmp(rtManager.apps.base[i].name, name) == 0) {
-            return rtamStop(&rtManager.apps.base[i]);
-        }
+RtAppErr rtamTerminate(const char *name) {
+    RtProcess *process = rtamGetProcess(name);
+    if (process == NULL) {
+        RTAM_PRINT("app %s not running", name);
+        return RTAM_FAIL;
     }
-    return -1;
+    rtamSuspend(process);
+    RtAppErr err = rtamStop(process);
+    if (err == RTAM_OK) {
+        rtamRemoveProcess(name);
+        return RTAM_OK;
+    }
+    return RTAM_FAIL;
 }
 #if RTAM_WITH_LETTER_SHELL == 1
 SHELL_EXPORT_CMD(SHELL_CMD_PERMISSION(0)|SHELL_CMD_TYPE(SHELL_TYPE_CMD_FUNC),
 rtamTerminate, rtamTerminate, terminate application\nrtamTerminate [name]);
 #endif
+
+
+RtAppErr rtamExit(const char *name) {
+    RtProcess *process = rtamGetProcess(name);
+    if (process == NULL) {
+        RTAM_PRINT("app %s not running", name);
+        return RTAM_FAIL;
+    }
+    if (process->app->flags.background) {
+        return rtamSuspend(process);
+    } else {
+        RTAM_PRINT("app %s not support suspend, terminate it", name);
+        return rtamStop(process);
+    }
+}
+#if RTAM_WITH_LETTER_SHELL == 1
+SHELL_EXPORT_CMD(SHELL_CMD_PERMISSION(0)|SHELL_CMD_TYPE(SHELL_TYPE_CMD_FUNC),
+rtamExit, rtamExit, exit application\nrtamExit [name]);
+#endif
+
+
+RtAppErr rtamSetStatus(const char *name, size_t status, bool set) {
+    RtProcess *process = rtamGetProcess(name);
+    if (process == NULL) {
+        return RTAM_FAIL;
+    }
+    if (set) {
+        process->status.value |= status;
+    } else {
+        process->status.value &= ~status;
+    }
+    process->status.processing = 0;
+    return RTAM_OK;
+}
 
 
 int rtamList(void) {
@@ -175,40 +382,25 @@ int rtamList(void) {
     }
     #endif /* RTAM_WITH_LETTER_SHELL == 1 */
 
-
-    for (size_t i = 0; i < rtManager.apps.count; i++) {
-        int (*getStatus)(void) = rtManager.apps.base[i].getStatus;
-        const char *status = "stopped";
-        if (getStatus) {
-            switch (RTAPP_GET_RUN_STATUS(getStatus())) {
-                case RTAPP_STATUS_STARING:
-                    status = "starting";
-                    break;
-                case RTAPP_STATUS_RUNNING:
-                    status = "running";
-                    break;
-                case RTAPP_STATUS_STOPPING:
-                    status = "stopping";
-                    break;
-                default:
-                    break;
-            }
-        } else {
-            status = "NaN";
-        }
+    RtProcess *head = rtManager.processes;
+    for (; head != NULL; head = head->next) {
     #if RTAM_WITH_LETTER_SHELL == 1
         if (shell != NULL) {
             shellPrint(shell,
-                       "%-12s %-8s %s\n",
-                       rtManager.apps.base[i].name,
-                       status,
-                       rtManager.apps.base[i].flags.autoStart ? "auto" : "manual");
+                       "%-12s %-1s|%-1s|%-4s %s\n",
+                       head->app->name,
+                       head->status.started ? "R" : "D",
+                       head->status.resuming ? "R" : "S",
+                       head->status.processing ? "P" : "N",
+                       head->app->flags.autoStart ? "auto" : "manual");
         } else {
     #endif /* RTAM_WITH_LETTER_SHELL == 1 */
-            RTAM_PRINT("%-12s %-8s %s",
-                       rtManager.apps.base[i].name,
-                       status,
-                       rtManager.apps.base[i].flags.autoStart ? "auto" : "manual");
+            RTAM_PRINT("%-12s %-1s|%-1s|%-4s %s\n",
+                       head->app->name,
+                       head->status.started ? "R" : "D",
+                       head->status.resuming ? "R" : "S",
+                       head->status.processing ? "P" : "N",
+                       head->app->flags.autoStart ? "auto" : "manual");
     #if RTAM_WITH_LETTER_SHELL == 1
         }
     #endif /* RTAM_WITH_LETTER_SHELL == 1 */
